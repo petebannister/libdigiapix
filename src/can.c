@@ -36,6 +36,12 @@
 /* map the sanitized data length to an appropriate data length code */
 #define CAN_LEN2DLC(len)		len > 64 ? 0xF : len2dlc[len]
 
+typedef struct ldx_can_iodata_t {
+	struct msghdr msg;
+	struct iovec iov;
+	char ctrlmsg[CMSG_SPACE(sizeof(struct timeval) + 3 *sizeof(struct timespec) + sizeof(__u32))];
+} ldx_can_iodata_t;
+
 /* CAN DLC to real data length conversion helpers */
 static const unsigned char dlc2len[] = {0, 1, 2, 3, 4, 5, 6, 7,
 					8, 12, 16, 20, 24, 32, 48, 64};
@@ -154,6 +160,8 @@ void ldx_can_set_defconfig(can_if_cfg_t *cfg)
 				  CAN_ERR_BUSOFF |
 				  CAN_ERR_BUSERROR |
 				  CAN_ERR_RESTARTED;
+
+	cfg->polled_mode = false; // Historically was like this by default.
 }
 
 static void process_can_process_msgheader(struct msghdr *msg, struct timeval *tv, uint32_t *df)
@@ -204,118 +212,204 @@ static void ldx_can_call_err_cb(const can_if_t *cif, int error, void *data)
 	}
 }
 
-static int ldx_can_process_tx_socket(const can_if_t *cif)
+
+static void ldx_can_init_iodata(const can_if_t *cif, ldx_can_event_t* evt, ldx_can_iodata_t* iodata)
 {
 	can_priv_t *pdata = cif->_data;
-	struct msghdr msg;
-	struct canfd_frame frame;
-	struct iovec iov;
-	char ctrlmsg[CMSG_SPACE(sizeof(struct timeval) + 3 *sizeof(struct timespec) + sizeof(__u32))];
-	int ret = EXIT_SUCCESS, nbytes;
-	bool done = false;
-
+	struct msghdr *msg = &iodata->msg;
+	
 	/* Lets do some initializations out of the main loop... */
-	iov.iov_base = &frame;
-	iov.iov_len = sizeof(frame);
+	iodata->iov.iov_base = &evt->frame;
+	iodata->iov.iov_len = sizeof(evt->frame);
 
-	msg.msg_name = &pdata->addr;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = &ctrlmsg;
-	msg.msg_namelen = sizeof(struct sockaddr_can);
-	msg.msg_controllen = sizeof(ctrlmsg);
-	msg.msg_flags = 0;
+	msg->msg_name = &pdata->addr;
+	msg->msg_iov = &iodata->iov;
+	msg->msg_iovlen = 1;
+	msg->msg_control = &ctrlmsg;
+	msg->msg_namelen = sizeof(struct sockaddr_can);
+	msg->msg_controllen = sizeof(ctrlmsg);
+	msg->msg_flags = 0;
+}
 
-	while (!done) {
-		nbytes = recvmsg(pdata->tx_skt, &msg, 0);
-		if (nbytes < 0) {
-			if (errno == ENETDOWN) {
-				log_error("%s: CAN network is down", __func__);
-				ret = -CAN_ERROR_NETWORK_DOWN;
-			}
-			return ret;
+static int ldx_can_poll_tx_socket_impl(const can_if_t *cif, ldx_can_event_t* evt, ldx_can_iodata_t* iodata)
+{
+	int nbytes = recvmsg(pdata->tx_skt, &iov->msg, 0);
+	if (nbytes < 0) {
+		if (errno == ENETDOWN) {
+			log_error("%s: CAN network is down", __func__);
+			return -CAN_ERROR_NETWORK_DOWN;
+		}
+		return EXIT_SUCCESS;
+	}
+	if (nbytes > 0) {
+		evt->is_error = (0 != (frame.can_id & CAN_ERR_FLAG));
+	}
+	return nbytes;
+}
+
+
+static int ldx_can_poll_tx_socket(const can_if_t *cif, ldx_can_event_t* evt)
+{
+	ldx_can_iov_data_t iodata;
+	ldx_can_init_iodata(cif, evt, &iodata);
+	return ldx_can_poll_tx_socket_impl(cif, evt, &iodata);
+}
+
+void ldx_can_dispatch_evt(const can_if_t *cif, ldx_can_event_t* evt) 
+{
+	can_priv_t *pdata = cif->_data;
+	if (evt->is_error) {
+		can_err_cb_t *err_cb;
+		list_for_each_entry(err_cb, &pdata->err_cb_list_head, list) {
+			if (err_cb->handler)
+				err_cb->handler(frame.can_id, NULL);
+		}
+	}
+	else if (evt->is_rx) {
+		can_cb_t *rx_cb;
+		if (evt->dropped_frames) {
+			ldx_can_call_err_cb(cif, CAN_ERROR_DROPPED_FRAMES, NULL);
 		}
 
-		if (nbytes == 0) {
-			done = true;
-			continue;
-		}
-
-		if (frame.can_id & CAN_ERR_FLAG) {
+		if (evt->is_error) {
 			can_err_cb_t *err_cb;
-
 			list_for_each_entry(err_cb, &pdata->err_cb_list_head, list) {
 				if (err_cb->handler)
 					err_cb->handler(frame.can_id, NULL);
 			}
 		}
+
+		list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
+			if (rx_cb->handler) {
+				if (rx_cb->rx_skt == evt->rx_skt) {
+					rx_cb->handler(&frame, &tstamp);
+				}
+			}
+		}
+
+	}
+}
+
+static int ldx_can_process_tx_socket(const can_if_t *cif)
+{
+	ldx_can_event_t evt;
+	ldx_can_iov_data_t iodata;
+	ldx_can_init_iodata(cif, evt, &iodata);
+
+	int ret = 1;
+	while (ret > 0) {
+		memset(&evt, 0, sizeof(evt));
+		ret = ldx_can_poll_tx_socket_impl(cif, &evt, &iodata);
+		ldx_can_dispatch_evt(cif, &evt);
 	}
 
 	return ret;
 }
 
+
+static int ldx_can_poll_rx_socket_impl(can_if_t *cif, can_cb_t *rx_cb, ldx_can_event_t* evt, ldx_can_iov_data_t* iodata)
+{
+	int nbytes = recvmsg(rx_cb->rx_skt, &iodata->msg, 0);
+	if (nbytes < 0) {
+		if (errno == ENETDOWN) {
+			log_error("%s: CAN network is down", __func__);
+			ret = -CAN_ERROR_NETWORK_DOWN;
+		}
+		return ret;
+	}
+
+	if (nbytes == 0) {
+		return EXIT_SUCCESS;
+	}
+
+	if(cif->cfg.process_header) {
+		process_can_process_msgheader(&iodata->msg, &evt->tstamp, &evt->dropped_frames);
+		if (evt->dropped_frames) {
+			log_error("%s: CAN frames dropped", __func__);
+			cif->dropped_frames = evt->dropped_frames;
+		}
+	}
+
+	evt->is_rx = true;
+	evt->rx_skt = rx_cb->rx_skt;
+	evt->is_error = (0 != (frame.can_id & CAN_ERR_FLAG));
+	
+	return ret;
+}
+
+
 static int ldx_can_process_rx_socket(can_if_t *cif, can_cb_t *rx_cb)
 {
+	ldx_can_event_t evt;
+	ldx_can_iov_data_t iodata;
+	ldx_can_init_iodata(cif, evt, &iodata);
+	
+	int ret = 1;
+	while (ret > 0) {
+		memset(&evt, 0, sizeof(evt));
+		ret = ldx_can_poll_rx_socket_impl(cif, rx_cb, &evt, &iodata);
+		ldx_can_dispatch_evt(cif, evt);
+	}
+	return ret;
+}
+
+
+int ldx_can_poll_one(const can_if_t* cif, struct timeval const* timeout, ldx_can_event_t* evt)
+{
 	can_priv_t *pdata = cif->_data;
-	struct timeval tstamp;
-	struct msghdr msg;
-	struct canfd_frame frame;
-	struct iovec iov;
-	char ctrlmsg[CMSG_SPACE(sizeof(struct timeval) + 3 *sizeof(struct timespec) + sizeof(__u32))];
-	int ret = EXIT_SUCCESS, nbytes;
-	bool done = false;
+	int ret;
+	fd_set fds;
 
-	/* Lets do some initializations out of the main loop... */
-	iov.iov_base = &frame;
-	iov.iov_len = sizeof(frame);
+	ldx_can_iov_data_t iodata;
+	ldx_can_init_iodata(cif, evt, &iodata);
 
-	msg.msg_name = &pdata->addr;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = &ctrlmsg;
-	msg.msg_namelen = sizeof(struct sockaddr_can);
-	msg.msg_controllen = sizeof(ctrlmsg);
-	msg.msg_flags = 0;
+	ldx_can_lock_mutex(cif, __func__);
 
-	while (!done) {
-		nbytes = recvmsg(rx_cb->rx_skt, &msg, 0);
-		if (nbytes < 0) {
-			if (errno == ENETDOWN) {
-				log_error("%s: CAN network is down", __func__);
-				ret = -CAN_ERROR_NETWORK_DOWN;
+	memcpy(&fds, &pdata->can_fds, sizeof(fds));
+
+	ret = select(pdata->maxfd + 1, &fds, NULL, NULL, tout);
+	if (ret < 0 && errno != EINTR) {
+		log_error("%s|%s: select error (%d|%d)",
+					cif->name, __func__, ret, errno);
+		ldx_can_unlock_mutex(cif);
+		return errno;
+	} else if (ret > 0) {
+		can_cb_t *rx_cb;
+
+		/*
+		* Check the socket for each registered rx handler and
+		* trigger the callback accordingly
+		*/
+		list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
+			if (FD_ISSET(rx_cb->rx_skt, &fds)) {
+				ret = ldx_can_poll_rx_socket_impl(cif, rx_cb, &evt, &iodata);
+				if (ret < 0) {
+					log_error("%s|%s: select error (%d|%d)",
+								cif->name, __func__, ret, errno);
+				}
+				ldx_can_unlock_mutex(cif);
+				return ret;
 			}
+		}
+
+		/* Check also the tx socket to detect errors */
+		if (FD_ISSET(pdata->tx_skt, &fds)) {
+			ret = ldx_can_poll_tx_socket_impl(cif, &evt, &iodata);
+			if (ret < 0)
+				log_error("%s|%s: select error (%d|%d)",
+							cif->name, __func__, ret, errno);
+			ldx_can_unlock_mutex(cif);
 			return ret;
 		}
 
-		if (nbytes == 0) {
-			done = true;
-			continue;
-		}
-
-		if(cif->cfg.process_header) {
-			uint32_t dropf = 0;
-
-			process_can_process_msgheader(&msg, &tstamp, &dropf);
-			if (dropf) {
-				log_error("%s: CAN frames dropped", __func__);
-				cif->dropped_frames = dropf;
-				ldx_can_call_err_cb(cif, CAN_ERROR_DROPPED_FRAMES, NULL);
-			}
-		}
-
-		if (frame.can_id & CAN_ERR_FLAG) {
-			can_err_cb_t *err_cb;
-
-			list_for_each_entry(err_cb, &pdata->err_cb_list_head, list) {
-				if (err_cb->handler)
-					err_cb->handler(frame.can_id, NULL);
-			}
-		}
-
-		if (rx_cb->handler)
-			rx_cb->handler(&frame, &tstamp);
+		// Should there be an indication that data was processed?
+		// It may be nicer to have a poll_one function and avoid the
+		// callbacks as really they can be factored out in the polled 
+		// case (and actually are quite inconvenient).
+		ret = 0;
 	}
 
+	ldx_can_unlock_mutex(cif);
 	return ret;
 }
 
@@ -345,7 +439,7 @@ int ldx_can_poll(const can_if_t* cif, struct timeval const* tout)
 		list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
 			if (FD_ISSET(rx_cb->rx_skt, &fds)) {
 				ret = ldx_can_process_rx_socket(cif, rx_cb);
-				if (ret) {
+				if (ret < 0) {
 					log_error("%s|%s: select error (%d|%d)",
 								cif->name, __func__, ret, errno);
 				}
@@ -355,7 +449,7 @@ int ldx_can_poll(const can_if_t* cif, struct timeval const* tout)
 		/* Check also the tx socket to detect errors */
 		if (FD_ISSET(pdata->tx_skt, &fds)) {
 			ret = ldx_can_process_tx_socket(cif);
-			if (ret)
+			if (ret < 0)
 				log_error("%s|%s: select error (%d|%d)",
 							cif->name, __func__, ret, errno);
 		}

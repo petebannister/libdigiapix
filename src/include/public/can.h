@@ -87,6 +87,15 @@ typedef struct can_if {
 	void			*_data;
 } can_if_t;
 
+typedef struct ldx_can_event_t {
+	int is_rx : 1;
+	int is_error : 1;
+	int rx_skt;
+	struct canfd_frame frame;
+	struct timeval tstamp;
+	uint32_t dropped_frames;
+} ldx_can_event_t;
+
 /* Error values for the CAN interface */
 enum {
 	CAN_ERROR_NONE = 0,
@@ -437,7 +446,7 @@ int ldx_can_unregister_error_handler(const can_if_t *cif, const ldx_can_error_cb
  * @cif:	A pointer to the CAN interface to poll.
  * @tm:		Timeout value.
  *
- * If @ref can_if_cfg::polled_mode was not set when opening the port then
+ * If \ref can_if_cfg::polled_mode was not set when opening the port then
  * normally this function should not be called directly; libdigiapix will run 
  * a background thread to do that.
  *
@@ -446,10 +455,42 @@ int ldx_can_unregister_error_handler(const can_if_t *cif, const ldx_can_error_cb
 int ldx_can_poll(const can_if_t* cif, struct timeval const* tm);
 
 /**
- * @copydoc ldx_can_poll
- * @milliseconds Timeout, in milliseconds.
+ * \copydoc ldx_can_poll
+ * @milliseconds: Timeout, in milliseconds.
  */
 int ldx_can_poll_msec(const can_if_t* cif, int milliseconds);
+
+/**
+ * ldx_can_poll_one() - Poll CAN interface for a single event.  The function will 
+ * block for the specified time unless data is received.
+ *
+ * This version of the polled interface will not dispatch to any callback 
+ * functions.  That can be done via \ref ldx_can_dispatch_evt or alternatively 
+ * the event can be processed directly, eliminating the need to add callback 
+ * functions.
+ *
+ * @cif:	A pointer to the CAN interface to poll.
+ * @tm:		Timeout value.
+ * @evt:	Event (out).  Caller is responsible for initializing structure contents to zero.
+ *
+ * If @ref can_if_cfg::polled_mode was not set when opening the port then
+ * normally this function should not be called directly; libdigiapix will run 
+ * a background thread to do that.
+ *
+ * \return: EXIT_SUCCESS on success, error code otherwise.
+ */
+int ldx_can_poll_one(const can_if_t* cif, struct timeval const* timeout, ldx_can_event_t* evt);
+/**
+ * ldx_can_dispatch_evt() - Dispatch CAN  to callback(s) registered with the CAN interface.
+ *
+ * This function would typically not be needed unless using ldx_can_poll_one and 
+ * callbacks are still desired.
+ * 
+ * @cif:	A pointer to the CAN interface.
+ * @evt:	Event to dispatch.
+ *
+ */
+void ldx_can_dispatch_evt(const can_if_t *cif, ldx_can_event_t* evt);
 
 /**
  * ldx_can_strerror() - return the string describing the error
