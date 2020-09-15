@@ -1,3 +1,16 @@
+This fork was taken in order to implement a polled mode on the CAN interface.
+The existing library has exceptionally high CPU usage (on the ConnectCore6UL 
+at least).
+
+Multi-threading this is unnecessary for many applications and also a risk 
+especially if the documentation does not cover how to use the library safely.
+
+The CAN data callbacks do not include a client pointer or even the can interface 
+pointer, making the API inconvenient to use in some cases, particularly from C++
+code.
+
+Polled mode via ldx_can_poll_one enables callbacks to be avoided entirely.
+
 Digi APIX Library
 =================
 Digi APIX is a C library that enables you to easily access and manage Digi
