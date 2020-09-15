@@ -77,6 +77,7 @@ typedef struct can_if_cfg {
 	struct can_bittiming	bit_timing;
 	struct can_bittiming	dbit_timing;
 	struct can_ctrlmode	ctrl_mode;
+	bool			polled_mode; /* Do not spin up a thread */
 } can_if_cfg_t;
 
 typedef struct can_if {
@@ -428,6 +429,27 @@ int ldx_can_register_error_handler(const can_if_t *cif, const ldx_can_error_cb_t
  * Return: EXIT_SUCCESS on success, error code otherwise.
  */
 int ldx_can_unregister_error_handler(const can_if_t *cif, const ldx_can_error_cb_t cb);
+
+/**
+ * ldx_can_poll() - Poll CAN interface for data.  The function will block for 
+ * the specified time unless data is received.
+ *
+ * @cif:	A pointer to the CAN interface to poll.
+ * @tm:		Timeout value.
+ *
+ * If @ref can_if_cfg::polled_mode was not set when opening the port then
+ * normally this function should not be called directly; libdigiapix will run 
+ * a background thread to do that.
+ *
+ * Return: EXIT_SUCCESS on success, error code otherwise.
+ */
+int ldx_can_poll(const can_if_t* cif, struct timeval const* tm);
+
+/**
+ * @copydoc ldx_can_poll
+ * @milliseconds Timeout, in milliseconds.
+ */
+int ldx_can_poll_msec(const can_if_t* cif, int milliseconds);
 
 /**
  * ldx_can_strerror() - return the string describing the error

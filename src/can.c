@@ -101,6 +101,28 @@ const char *const __can_error_str[CAN_ERROR_MAX + 1] = {
 	[CAN_ERROR_DROPPED_FRAMES]		= "Dropped frames",
 };
 
+static inline int ldx_can_lock_mutex(const can_if_t *cif, char const* fn) 
+{
+	can_priv_t *pdata = cif->_data;
+	if (pdata->mutex) {
+		int ret = pthread_mutex_lock(&pdata->mutex);
+		if (ret) {
+			log_error("%s: error mutex lock %s",
+				fn, cif->name);
+			return -CAN_ERROR_THREAD_MUTEX_LOCK;
+		}
+	}
+	return 0;
+}
+
+static inline void ldx_can_unlock_mutex(const can_if_t *cif) 
+{
+	can_priv_t *pdata = cif->_data;
+	if (pdata->mutex) {
+		pthread_mutex_unlock(&pdata->mutex);
+	}
+}
+
 static void ldx_can_default_error_handler(int error, void *data)
 {
 	/* Default error handler, used to log information */
@@ -297,6 +319,66 @@ static int ldx_can_process_rx_socket(can_if_t *cif, can_cb_t *rx_cb)
 	return ret;
 }
 
+
+int ldx_can_poll(const can_if_t* cif, struct timeval const* tout)
+{
+	can_priv_t *pdata = cif->_data;
+	int ret;
+	fd_set fds;
+
+	ldx_can_lock_mutex(cif, __func__);
+
+	memcpy(&fds, &pdata->can_fds, sizeof(fds));
+
+	ret = select(pdata->maxfd + 1, &fds, NULL, NULL, tout);
+	if (ret < 0 && errno != EINTR) {
+		log_error("%s|%s: select error (%d|%d)",
+					cif->name, __func__, ret, errno);
+		ldx_can_call_err_cb(cif, errno, NULL);
+	} else if (ret > 0) {
+		can_cb_t *rx_cb;
+
+		/*
+		* Check the socket for each registered rx handler and
+		* trigger the callback accordingly
+		*/
+		list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
+			if (FD_ISSET(rx_cb->rx_skt, &fds)) {
+				ret = ldx_can_process_rx_socket(cif, rx_cb);
+				if (ret) {
+					log_error("%s|%s: select error (%d|%d)",
+								cif->name, __func__, ret, errno);
+				}
+			}
+		}
+
+		/* Check also the tx socket to detect errors */
+		if (FD_ISSET(pdata->tx_skt, &fds)) {
+			ret = ldx_can_process_tx_socket(cif);
+			if (ret)
+				log_error("%s|%s: select error (%d|%d)",
+							cif->name, __func__, ret, errno);
+		}
+
+		// Should there be an indication that data was processed?
+		// It may be nicer to have a poll_one function and avoid the
+		// callbacks as really they can be factored out in the polled 
+		// case (and actually are quite inconvenient).
+		ret = 0;
+	}
+
+	ldx_can_unlock_mutex(cif);
+	return ret;
+}
+
+int ldx_can_poll_msec(const can_if_t* cif, int milliseconds)
+{
+	struct timeval tout;
+	tout.tv_sec = (milliseconds / 1000);
+	tout.tv_usec = (milliseconds % 1000) * 1000;
+	return ldx_can_poll(cif, &tout);
+}
+
 static void *ldx_can_thr(void *arg)
 {
 	can_if_t *cif = (can_if_t *)arg;
@@ -304,47 +386,7 @@ static void *ldx_can_thr(void *arg)
 	int ret;
 
 	while (pdata->run_thr) {
-		fd_set fds;
-		struct timeval tout;
-
-		pthread_mutex_lock(&pdata->mutex);
-
-		memcpy(&fds, &pdata->can_fds, sizeof(fds));
-		memcpy(&tout, &pdata->can_tout, sizeof(tout));
-
-		ret = select(pdata->maxfd + 1, &fds, NULL, NULL, &tout);
-		if (ret < 0 && errno != EINTR) {
-			log_error("%s|%s: select error (%d|%d)",
-					  cif->name, __func__, ret, errno);
-			ldx_can_call_err_cb(cif, errno, NULL);
-		} else if (ret > 0) {
-			can_cb_t *rx_cb;
-
-			/*
-			 * Check the socket for each registered rx handler and
-			 * trigger the callback accordingly
-			 */
-			list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
-				if (FD_ISSET(rx_cb->rx_skt, &fds)) {
-					ret = ldx_can_process_rx_socket(cif, rx_cb);
-					if (ret) {
-						log_error("%s|%s: select error (%d|%d)",
-								  cif->name, __func__, ret, errno);
-					}
-				}
-			}
-
-			/* Check also the tx socket to detect errors */
-			if (FD_ISSET(pdata->tx_skt, &fds)) {
-				ret = ldx_can_process_tx_socket(cif);
-				if (ret)
-					log_error("%s|%s: select error (%d|%d)",
-							  cif->name, __func__, ret, errno);
-			}
-		}
-
-		pthread_mutex_unlock(&pdata->mutex);
-
+		(void) ldx_can_poll(cif, &pdata->can_tout);
 		sched_yield();
 	}
 	return NULL;
@@ -544,34 +586,36 @@ int ldx_can_init(can_if_t *cif, can_if_cfg_t *cfg)
 	}
 
 	/* Create the thread to process async events */
-	if (!pdata->can_thr) {
-		pdata->can_thr = malloc(sizeof(pthread_t));
+	if (!cfg->polled_mode) {
 		if (!pdata->can_thr) {
-			log_error("%s: Unable to alloc thread memory in %s",
-				  __func__, cif->name);
-			ret = -CAN_ERROR_THREAD_ALLOC;
-			goto err_skt_close;
-		}
+			pdata->can_thr = malloc(sizeof(pthread_t));
+			if (!pdata->can_thr) {
+				log_error("%s: Unable to alloc thread memory in %s",
+					__func__, cif->name);
+				ret = -CAN_ERROR_THREAD_ALLOC;
+				goto err_skt_close;
+			}
 
-		pthread_attr_init(&pdata->can_thr_attr);
-		pthread_attr_setschedpolicy(&pdata->can_thr_attr, SCHED_FIFO);
+			pthread_attr_init(&pdata->can_thr_attr);
+			pthread_attr_setschedpolicy(&pdata->can_thr_attr, SCHED_FIFO);
 
-		ret = pthread_mutex_init(&pdata->mutex, NULL);
-		if (ret) {
-			log_error("%s: Unable init thread mutex %s",
-				  __func__, cif->name);
-			ret = -CAN_ERROR_THREAD_MUTEX_INIT;
-			goto err_thr_alloc;
-		}
+			ret = pthread_mutex_init(&pdata->mutex, NULL);
+			if (ret) {
+				log_error("%s: Unable init thread mutex %s",
+					__func__, cif->name);
+				ret = -CAN_ERROR_THREAD_MUTEX_INIT;
+				goto err_thr_alloc;
+			}
 
-		ret = pthread_create(pdata->can_thr, NULL, ldx_can_thr, cif);
-		if (ret) {
-			log_error("%s: Unable to create thread in %s",
-				  __func__, cif->name);
-			pthread_mutex_unlock(&pdata->mutex);
-			pthread_mutex_destroy(&pdata->mutex);
-			ret = -CAN_ERROR_THREAD_CREATE;
-			goto err_thr_alloc;
+			ret = pthread_create(pdata->can_thr, NULL, ldx_can_thr, cif);
+			if (ret) {
+				log_error("%s: Unable to create thread in %s",
+					__func__, cif->name);
+				pthread_mutex_unlock(&pdata->mutex);
+				pthread_mutex_destroy(&pdata->mutex);
+				ret = -CAN_ERROR_THREAD_CREATE;
+				goto err_thr_alloc;
+			}
 		}
 	}
 
@@ -647,9 +691,17 @@ int ldx_can_free(can_if_t *cif)
 		return EXIT_SUCCESS;
 
 	pdata = cif->_data;
-	pthread_mutex_lock(&pdata->mutex);
-	pthread_mutex_destroy(&pdata->mutex);
-	pthread_cancel(*pdata->can_thr);
+
+	if (pdata->mutex) {
+		pthread_mutex_lock(&pdata->mutex);
+		pthread_mutex_destroy(&pdata->mutex);
+		pdata->mutex = 0;
+	}
+
+	if (pdata->can_thr) {
+		pthread_cancel(*pdata->can_thr);
+		pdata->can_thr = 0;
+	}
 
 	ret = ldx_can_stop(cif);
 	if (ret)
@@ -724,11 +776,9 @@ int ldx_can_register_error_handler(const can_if_t *cif, const ldx_can_error_cb_t
 
 	pdata = cif->_data;
 
-	ret = pthread_mutex_lock(&pdata->mutex);
+	ret = ldx_can_lock_mutex(cif, __func__);	
 	if (ret) {
-		log_error("%s: error mutex lock %s",
-			  __func__, cif->name);
-		return -CAN_ERROR_THREAD_MUTEX_LOCK;
+		return ret;
 	}
 
 	/* Ensure the callback is not registered more than once */
@@ -751,7 +801,7 @@ int ldx_can_register_error_handler(const can_if_t *cif, const ldx_can_error_cb_t
 	list_add(&(errcb->list), &(pdata->err_cb_list_head));
 
 ecb_err_unlock:
-	pthread_mutex_unlock(&pdata->mutex);
+	ldx_can_unlock_mutex(cif);
 
 	return ret;
 }
@@ -767,11 +817,8 @@ int ldx_can_unregister_error_handler(const can_if_t *cif, const ldx_can_error_cb
 
 	pdata = cif->_data;
 
-	ret = pthread_mutex_lock(&pdata->mutex);
+	ret = ldx_can_lock_mutex(cif, __func__);	
 	if (ret) {
-		log_error("%s: error mutex lock %s",
-			  __func__, cif->name);
-		ret = -CAN_ERROR_THREAD_MUTEX_LOCK;
 		goto unreg_errh_ret;
 	}
 
@@ -787,7 +834,7 @@ int ldx_can_unregister_error_handler(const can_if_t *cif, const ldx_can_error_cb
 	free(errcb);
 
 unreg_errh_unlock:
-	pthread_mutex_unlock(&pdata->mutex);
+	ldx_can_unlock_mutex(cif);
 
 unreg_errh_ret:
 	return ret;
@@ -821,11 +868,9 @@ int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
 
 	pdata = cif->_data;
 
-	ret = pthread_mutex_lock(&pdata->mutex);
+	ret = ldx_can_lock_mutex(cif, __func__);	
 	if (ret) {
-		log_error("%s: error mutex lock %s",
-			  __func__, cif->name);
-		return -CAN_ERROR_THREAD_MUTEX_LOCK;
+		return ret;
 	}
 
 	/* Ensure the callback is not registered more than once */
@@ -973,7 +1018,7 @@ int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
 
 	rxcb->handler = cb;
 	list_add(&(rxcb->list), &(pdata->rx_cb_list_head));
-	pthread_mutex_unlock(&pdata->mutex);
+	ldx_can_unlock_mutex(cif);
 
 	return CAN_ERROR_NONE;
 
@@ -984,7 +1029,7 @@ rx_err_free:
 	free(rxcb);
 
 rx_err_unlock:
-	pthread_mutex_unlock(&pdata->mutex);
+	ldx_can_unlock_mutex(cif);
 
 	return ret;
 }
@@ -999,11 +1044,8 @@ int ldx_can_unregister_rx_handler(const can_if_t *cif, const ldx_can_rx_cb_t cb)
 		return -CAN_ERROR_NULL_INTERFACE;
 
 	pdata = cif->_data;
-	ret = pthread_mutex_lock(&pdata->mutex);
+	ret = ldx_can_lock_mutex(cif, __func__);	
 	if (ret) {
-		log_error("%s: error mutex lock %s",
-			  __func__, cif->name);
-		ret = -CAN_ERROR_THREAD_MUTEX_LOCK;
 		goto unreg_rxh_ret;
 	}
 
@@ -1022,7 +1064,7 @@ int ldx_can_unregister_rx_handler(const can_if_t *cif, const ldx_can_rx_cb_t cb)
 	free(rxcb);
 
 unreg_rxh_unlock:
-	pthread_mutex_unlock(&pdata->mutex);
+	ldx_can_unlock_mutex(cif);
 
 unreg_rxh_ret:
 	return ret;
