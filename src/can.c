@@ -322,7 +322,7 @@ static void *ldx_can_thr(void *arg)
 
 			/*
 			 * Check the socket for each registered rx handler and
-			 * trigger the callback acordingly
+			 * trigger the callback accordingly
 			 */
 			list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
 				if (FD_ISSET(rx_cb->rx_skt, &fds)) {
