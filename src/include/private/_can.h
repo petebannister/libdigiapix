@@ -94,6 +94,8 @@ typedef struct {
 	struct list_head	rx_cb_list_head;
 	struct list_head	err_cb_list_head;
 
+	bool has_mutex;
+
 } can_priv_t;
 
 #ifdef __cplusplus

@@ -439,6 +439,8 @@ int ldx_can_register_error_handler(const can_if_t *cif, const ldx_can_error_cb_t
  */
 int ldx_can_unregister_error_handler(const can_if_t *cif, const ldx_can_error_cb_t cb);
 
+int ldx_can_set_thread_poll_rate(const can_if_t* cif, struct timeval* timeout);
+int ldx_can_set_thread_poll_rate_msec(const can_if_t* cif, int milliseconds);
 /**
  * ldx_can_poll() - Poll CAN interface for data.  The function will block for 
  * the specified time unless data is received.
@@ -452,7 +454,7 @@ int ldx_can_unregister_error_handler(const can_if_t *cif, const ldx_can_error_cb
  *
  * Return: EXIT_SUCCESS on success, error code otherwise.
  */
-int ldx_can_poll(const can_if_t* cif, struct timeval const* tm);
+int ldx_can_poll(const can_if_t* cif, struct timeval* tm);
 
 /**
  * \copydoc ldx_can_poll
@@ -479,7 +481,7 @@ int ldx_can_poll_msec(const can_if_t* cif, int milliseconds);
  *
  * \return: EXIT_SUCCESS on success, error code otherwise.
  */
-int ldx_can_poll_one(const can_if_t* cif, struct timeval const* timeout, ldx_can_event_t* evt);
+int ldx_can_poll_one(const can_if_t* cif, struct timeval* timeout, ldx_can_event_t* evt);
 /**
  * ldx_can_dispatch_evt() - Dispatch CAN  to callback(s) registered with the CAN interface.
  *

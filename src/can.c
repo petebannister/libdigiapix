@@ -110,7 +110,7 @@ const char *const __can_error_str[CAN_ERROR_MAX + 1] = {
 static inline int ldx_can_lock_mutex(const can_if_t *cif, char const* fn) 
 {
 	can_priv_t *pdata = cif->_data;
-	if (pdata->mutex) {
+	if (pdata->has_mutex) {
 		int ret = pthread_mutex_lock(&pdata->mutex);
 		if (ret) {
 			log_error("%s: error mutex lock %s",
@@ -124,13 +124,14 @@ static inline int ldx_can_lock_mutex(const can_if_t *cif, char const* fn)
 static inline void ldx_can_unlock_mutex(const can_if_t *cif) 
 {
 	can_priv_t *pdata = cif->_data;
-	if (pdata->mutex) {
+	if (pdata->has_mutex) {
 		pthread_mutex_unlock(&pdata->mutex);
 	}
 }
 
 static void ldx_can_default_error_handler(int error, void *data)
 {
+	(void) data;
 	/* Default error handler, used to log information */
 	log_error("%s: error: %d, %s", __func__, error, ldx_can_strerror(error));
 }
@@ -225,15 +226,16 @@ static void ldx_can_init_iodata(const can_if_t *cif, ldx_can_event_t* evt, ldx_c
 	msg->msg_name = &pdata->addr;
 	msg->msg_iov = &iodata->iov;
 	msg->msg_iovlen = 1;
-	msg->msg_control = &ctrlmsg;
+	msg->msg_control = &iodata->ctrlmsg;
 	msg->msg_namelen = sizeof(struct sockaddr_can);
-	msg->msg_controllen = sizeof(ctrlmsg);
+	msg->msg_controllen = sizeof(iodata->ctrlmsg);
 	msg->msg_flags = 0;
 }
 
 static int ldx_can_poll_tx_socket_impl(const can_if_t *cif, ldx_can_event_t* evt, ldx_can_iodata_t* iodata)
 {
-	int nbytes = recvmsg(pdata->tx_skt, &iov->msg, 0);
+	can_priv_t *pdata = cif->_data;
+	int nbytes = recvmsg(pdata->tx_skt, &iodata->msg, 0);
 	if (nbytes < 0) {
 		if (errno == ENETDOWN) {
 			log_error("%s: CAN network is down", __func__);
@@ -242,17 +244,9 @@ static int ldx_can_poll_tx_socket_impl(const can_if_t *cif, ldx_can_event_t* evt
 		return EXIT_SUCCESS;
 	}
 	if (nbytes > 0) {
-		evt->is_error = (0 != (frame.can_id & CAN_ERR_FLAG));
+		evt->is_error = (0 != (evt->frame.can_id & CAN_ERR_FLAG));
 	}
 	return nbytes;
-}
-
-
-static int ldx_can_poll_tx_socket(const can_if_t *cif, ldx_can_event_t* evt)
-{
-	ldx_can_iov_data_t iodata;
-	ldx_can_init_iodata(cif, evt, &iodata);
-	return ldx_can_poll_tx_socket_impl(cif, evt, &iodata);
 }
 
 void ldx_can_dispatch_evt(const can_if_t *cif, ldx_can_event_t* evt) 
@@ -262,7 +256,7 @@ void ldx_can_dispatch_evt(const can_if_t *cif, ldx_can_event_t* evt)
 		can_err_cb_t *err_cb;
 		list_for_each_entry(err_cb, &pdata->err_cb_list_head, list) {
 			if (err_cb->handler)
-				err_cb->handler(frame.can_id, NULL);
+				err_cb->handler(evt->frame.can_id, NULL);
 		}
 	}
 	else if (evt->is_rx) {
@@ -275,14 +269,14 @@ void ldx_can_dispatch_evt(const can_if_t *cif, ldx_can_event_t* evt)
 			can_err_cb_t *err_cb;
 			list_for_each_entry(err_cb, &pdata->err_cb_list_head, list) {
 				if (err_cb->handler)
-					err_cb->handler(frame.can_id, NULL);
+					err_cb->handler(evt->frame.can_id, NULL);
 			}
 		}
 
 		list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
 			if (rx_cb->handler) {
 				if (rx_cb->rx_skt == evt->rx_skt) {
-					rx_cb->handler(&frame, &tstamp);
+					rx_cb->handler(&evt->frame, &evt->tstamp);
 				}
 			}
 		}
@@ -293,8 +287,8 @@ void ldx_can_dispatch_evt(const can_if_t *cif, ldx_can_event_t* evt)
 static int ldx_can_process_tx_socket(const can_if_t *cif)
 {
 	ldx_can_event_t evt;
-	ldx_can_iov_data_t iodata;
-	ldx_can_init_iodata(cif, evt, &iodata);
+	ldx_can_iodata_t iodata;
+	ldx_can_init_iodata(cif, &evt, &iodata);
 
 	int ret = 1;
 	while (ret > 0) {
@@ -307,8 +301,9 @@ static int ldx_can_process_tx_socket(const can_if_t *cif)
 }
 
 
-static int ldx_can_poll_rx_socket_impl(can_if_t *cif, can_cb_t *rx_cb, ldx_can_event_t* evt, ldx_can_iov_data_t* iodata)
+static int ldx_can_poll_rx_socket_impl(can_if_t *cif, can_cb_t *rx_cb, ldx_can_event_t* evt, ldx_can_iodata_t* iodata)
 {
+	int ret = 0;
 	int nbytes = recvmsg(rx_cb->rx_skt, &iodata->msg, 0);
 	if (nbytes < 0) {
 		if (errno == ENETDOWN) {
@@ -332,7 +327,7 @@ static int ldx_can_poll_rx_socket_impl(can_if_t *cif, can_cb_t *rx_cb, ldx_can_e
 
 	evt->is_rx = true;
 	evt->rx_skt = rx_cb->rx_skt;
-	evt->is_error = (0 != (frame.can_id & CAN_ERR_FLAG));
+	evt->is_error = (0 != (evt->frame.can_id & CAN_ERR_FLAG));
 	
 	return ret;
 }
@@ -341,33 +336,33 @@ static int ldx_can_poll_rx_socket_impl(can_if_t *cif, can_cb_t *rx_cb, ldx_can_e
 static int ldx_can_process_rx_socket(can_if_t *cif, can_cb_t *rx_cb)
 {
 	ldx_can_event_t evt;
-	ldx_can_iov_data_t iodata;
-	ldx_can_init_iodata(cif, evt, &iodata);
+	ldx_can_iodata_t iodata;
+	ldx_can_init_iodata(cif, &evt, &iodata);
 	
 	int ret = 1;
 	while (ret > 0) {
 		memset(&evt, 0, sizeof(evt));
 		ret = ldx_can_poll_rx_socket_impl(cif, rx_cb, &evt, &iodata);
-		ldx_can_dispatch_evt(cif, evt);
+		ldx_can_dispatch_evt(cif, &evt);
 	}
 	return ret;
 }
 
 
-int ldx_can_poll_one(const can_if_t* cif, struct timeval const* timeout, ldx_can_event_t* evt)
+int ldx_can_poll_one(const can_if_t* cif, struct timeval* timeout, ldx_can_event_t* evt)
 {
 	can_priv_t *pdata = cif->_data;
 	int ret;
 	fd_set fds;
 
-	ldx_can_iov_data_t iodata;
+	ldx_can_iodata_t iodata;
 	ldx_can_init_iodata(cif, evt, &iodata);
 
 	ldx_can_lock_mutex(cif, __func__);
 
 	memcpy(&fds, &pdata->can_fds, sizeof(fds));
 
-	ret = select(pdata->maxfd + 1, &fds, NULL, NULL, tout);
+	ret = select(pdata->maxfd + 1, &fds, NULL, NULL, timeout);
 	if (ret < 0 && errno != EINTR) {
 		log_error("%s|%s: select error (%d|%d)",
 					cif->name, __func__, ret, errno);
@@ -382,7 +377,7 @@ int ldx_can_poll_one(const can_if_t* cif, struct timeval const* timeout, ldx_can
 		*/
 		list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
 			if (FD_ISSET(rx_cb->rx_skt, &fds)) {
-				ret = ldx_can_poll_rx_socket_impl(cif, rx_cb, &evt, &iodata);
+				ret = ldx_can_poll_rx_socket_impl((can_if_t*)cif, rx_cb, evt, &iodata);
 				if (ret < 0) {
 					log_error("%s|%s: select error (%d|%d)",
 								cif->name, __func__, ret, errno);
@@ -394,7 +389,7 @@ int ldx_can_poll_one(const can_if_t* cif, struct timeval const* timeout, ldx_can
 
 		/* Check also the tx socket to detect errors */
 		if (FD_ISSET(pdata->tx_skt, &fds)) {
-			ret = ldx_can_poll_tx_socket_impl(cif, &evt, &iodata);
+			ret = ldx_can_poll_tx_socket_impl(cif, evt, &iodata);
 			if (ret < 0)
 				log_error("%s|%s: select error (%d|%d)",
 							cif->name, __func__, ret, errno);
@@ -414,7 +409,7 @@ int ldx_can_poll_one(const can_if_t* cif, struct timeval const* timeout, ldx_can
 }
 
 
-int ldx_can_poll(const can_if_t* cif, struct timeval const* tout)
+int ldx_can_poll(const can_if_t* cif, struct timeval* tout)
 {
 	can_priv_t *pdata = cif->_data;
 	int ret;
@@ -438,7 +433,7 @@ int ldx_can_poll(const can_if_t* cif, struct timeval const* tout)
 		*/
 		list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
 			if (FD_ISSET(rx_cb->rx_skt, &fds)) {
-				ret = ldx_can_process_rx_socket(cif, rx_cb);
+				ret = ldx_can_process_rx_socket((can_if_t*)cif, rx_cb);
 				if (ret < 0) {
 					log_error("%s|%s: select error (%d|%d)",
 								cif->name, __func__, ret, errno);
@@ -477,8 +472,6 @@ static void *ldx_can_thr(void *arg)
 {
 	can_if_t *cif = (can_if_t *)arg;
 	can_priv_t *pdata = cif->_data;
-	int ret;
-
 	while (pdata->run_thr) {
 		(void) ldx_can_poll(cif, &pdata->can_tout);
 		sched_yield();
@@ -679,6 +672,7 @@ int ldx_can_init(can_if_t *cif, can_if_cfg_t *cfg)
 		goto err_skt_close;
 	}
 
+	pdata->has_mutex = false;
 	/* Create the thread to process async events */
 	if (!cfg->polled_mode) {
 		if (!pdata->can_thr) {
@@ -700,7 +694,7 @@ int ldx_can_init(can_if_t *cif, can_if_cfg_t *cfg)
 				ret = -CAN_ERROR_THREAD_MUTEX_INIT;
 				goto err_thr_alloc;
 			}
-
+			pdata->has_mutex = true;
 			ret = pthread_create(pdata->can_thr, NULL, ldx_can_thr, cif);
 			if (ret) {
 				log_error("%s: Unable to create thread in %s",
@@ -786,10 +780,10 @@ int ldx_can_free(can_if_t *cif)
 
 	pdata = cif->_data;
 
-	if (pdata->mutex) {
+	if (pdata->has_mutex) {
 		pthread_mutex_lock(&pdata->mutex);
 		pthread_mutex_destroy(&pdata->mutex);
-		pdata->mutex = 0;
+		pdata->has_mutex = 0;
 	}
 
 	if (pdata->can_thr) {
@@ -902,15 +896,12 @@ ecb_err_unlock:
 
 int ldx_can_unregister_error_handler(const can_if_t *cif, const ldx_can_error_cb_t cb)
 {
-	can_priv_t *pdata = NULL;
 	can_err_cb_t *errcb;
 	int ret;
 
-	if (!cif)
+	if (!cif) {
 		return -CAN_ERROR_NULL_INTERFACE;
-
-	pdata = cif->_data;
-
+	}
 	ret = ldx_can_lock_mutex(cif, __func__);	
 	if (ret) {
 		goto unreg_errh_ret;
@@ -1162,4 +1153,17 @@ unreg_rxh_unlock:
 
 unreg_rxh_ret:
 	return ret;
+}
+int ldx_can_set_thread_poll_rate(const can_if_t* cif, struct timeval* timeout)
+{
+	can_priv_t *pdata = cif->_data;
+	pdata->can_tout = *timeout;
+	return 0;
+}
+int ldx_can_set_thread_poll_rate_msec(const can_if_t* cif, int milliseconds)
+{
+	struct timeval timeout;
+	timeout.tv_sec = milliseconds / 1000;
+	timeout.tv_usec = (milliseconds % 1000) * 1000;
+	return ldx_can_set_thread_poll_rate(cif, &timeout);
 }
