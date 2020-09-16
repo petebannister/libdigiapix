@@ -410,11 +410,30 @@ int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
  */
 int ldx_can_unregister_rx_handler(const can_if_t *cif, const ldx_can_rx_cb_t cb);
 
+/**
+ * Internal implementation of ldx_can_register_rx_handler.
+ * 
+ * Returned file descriptor is not automatically closed, use
+ * ldx_can_close_rx_socket.
+ * 
+ * \return A CAN socket file descriptor on success, negative value upon failure.
+ */
 int ldx_can_open_rx_socket(can_if_t* cif,
 	struct can_filter* filters, int nfilters);
 
+/**
+ * Close the given CAN socket file descriptor.  Only use this on file descriptors 
+ * returned by \ref ldx_can_open_rx_socket.
+ * 
+ * \return Negative value upon failure.
+ */
 int ldx_can_close_rx_socket(const can_if_t* cif, int skt);
 
+/**
+ * Return CAN socket associated with the CAN Transmit channel.
+ * 
+ * \return Negative value upon failure, otherwise the file descriptor.
+ */
 int ldx_can_get_tx_skt(const can_if_t* cif);
 /**
  * ldx_can_register_error_handler() - Start an error handler on the given CAN
@@ -510,12 +529,16 @@ void ldx_can_unlock_mutex(const can_if_t* cif);
 */
 int ldx_can_read_tx_socket_i(const can_if_t* cif, ldx_can_event_t* evt);
 /**
-* Allows external select()
-* Does not lock mutex
-*/
+ * Read a single CAN event / frame from the CAN socket.
+ * Allows external select()
+ * Does not lock mutex
+ */
 int ldx_can_read_rx_socket_i(const can_if_t* cif, int rx_skt, ldx_can_event_t* evt);
 /**
-* Does not lock mutex
+ * Read all available CAN events / frames from the readable sockets and 
+ * dispatch to callback functions.
+ * 
+ * Does not lock mutex
 */
 int ldx_can_read_and_dispatch_i(const can_if_t* cif, fd_set* fds);
 

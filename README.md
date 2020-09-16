@@ -9,7 +9,46 @@ The CAN data callbacks do not include a client pointer or even the can interface
 pointer, making the API inconvenient to use in some cases, particularly from C++
 code.
 
-Polled mode via ldx_can_poll_one enables callbacks to be avoided entirely.
+The modifications should allow the existing library to function as it did before
+whilst opening up the possibility of lower level control that does not prescribe
+a threading model etc.
+
+It is possible to open channels on the CAN device via ldx_can_open_rx_socket 
+and implement a select() outside of the library in order to multiplex other IO 
+within the same wait.
+
+e.g.
+
+    int can = ldx_can_open_rx_socket(cif, 0, 0);
+    if (can < 0) {
+      return can; // error code
+    }
+    int udp = socket(AF_INET, SOCK_DGRAM, 0);
+    // ...
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(can, &fds);
+    FD_SET(udp, &fds);
+    timeval tm;
+    tm.tv_sec = timeout_ms / 1000;
+    tm.tv_usec = (timeout_ms % 1000) * 1000;
+    
+    int sr = ::select(FD_SETSIZE, &fds, nullptr, nullptr, &tm);
+    if (sr > 0) { // is 'any' socket readable?
+      if (FD_ISSET(can, &fds)) {
+        ldx_can_event_t evt;
+        memset(&evt, 0, sizeof(evt));
+        while (ldx_can_read_rx_socket_i(cif, can, &evt) > 0) {
+          dispatch(&evt);
+        }
+      }
+      if (FD_ISSET(udp, &fds)) {
+        readUdp(udp)
+      }
+    }
+    // ...
+    ldx_can_close_rx_socket(can);
+    close(udp);
 
 Digi APIX Library
 =================
