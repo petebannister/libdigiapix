@@ -13,6 +13,13 @@ The modifications should allow the existing library to function as it did before
 whilst opening up the possibility of lower level control that does not prescribe
 a threading model etc.
 
+In order to disable threading on the CAN port, specify 
+
+    polled_mode = false;
+
+in the can_if_cfg struct.
+
+
 It is possible to open channels on the CAN device via ldx_can_open_rx_socket 
 and implement a select() outside of the library in order to multiplex other IO 
 within the same wait.
