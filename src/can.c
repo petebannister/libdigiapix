@@ -36,11 +36,6 @@
 /* map the sanitized data length to an appropriate data length code */
 #define CAN_LEN2DLC(len)		len > 64 ? 0xF : len2dlc[len]
 
-typedef struct ldx_can_iodata_t {
-	struct msghdr msg;
-	struct iovec iov;
-	char ctrlmsg[CMSG_SPACE(sizeof(struct timeval) + 3 *sizeof(struct timespec) + sizeof(__u32))];
-} ldx_can_iodata_t;
 
 /* CAN DLC to real data length conversion helpers */
 static const unsigned char dlc2len[] = {0, 1, 2, 3, 4, 5, 6, 7,
@@ -107,7 +102,11 @@ const char *const __can_error_str[CAN_ERROR_MAX + 1] = {
 	[CAN_ERROR_DROPPED_FRAMES]		= "Dropped frames",
 };
 
-static inline int ldx_can_lock_mutex(const can_if_t *cif, char const* fn) 
+static void ldx_can_close_rx_socket_impl(const can_if_t* cif, int rx_skt);
+static int ldx_can_open_rx_socket_impl(can_if_t* cif,
+	struct can_filter* filters, int nfilters);
+
+int ldx_can_lock_mutex(const can_if_t *cif, char const* fn) 
 {
 	can_priv_t *pdata = cif->_data;
 	if (pdata->has_mutex) {
@@ -121,7 +120,7 @@ static inline int ldx_can_lock_mutex(const can_if_t *cif, char const* fn)
 	return 0;
 }
 
-static inline void ldx_can_unlock_mutex(const can_if_t *cif) 
+void ldx_can_unlock_mutex(const can_if_t *cif) 
 {
 	can_priv_t *pdata = cif->_data;
 	if (pdata->has_mutex) {
@@ -214,28 +213,36 @@ static void ldx_can_call_err_cb(const can_if_t *cif, int error, void *data)
 }
 
 
-static void ldx_can_init_iodata(const can_if_t *cif, ldx_can_event_t* evt, ldx_can_iodata_t* iodata)
+static void ldx_can_init_iodata(can_priv_t *pdata)
 {
-	can_priv_t *pdata = cif->_data;
-	struct msghdr *msg = &iodata->msg;
-	
-	/* Lets do some initializations out of the main loop... */
-	iodata->iov.iov_base = &evt->frame;
-	iodata->iov.iov_len = sizeof(evt->frame);
-
+	struct msghdr *msg = &pdata->msg;
 	msg->msg_name = &pdata->addr;
-	msg->msg_iov = &iodata->iov;
+	msg->msg_iov = &pdata->iov;
 	msg->msg_iovlen = 1;
-	msg->msg_control = &iodata->ctrlmsg;
+	msg->msg_control = &pdata->ctrlmsg;
 	msg->msg_namelen = sizeof(struct sockaddr_can);
-	msg->msg_controllen = sizeof(iodata->ctrlmsg);
+	msg->msg_controllen = sizeof(pdata->ctrlmsg);
 	msg->msg_flags = 0;
 }
-
-static int ldx_can_poll_tx_socket_impl(const can_if_t *cif, ldx_can_event_t* evt, ldx_can_iodata_t* iodata)
+void ldx_can_io_set_evt_ptr(const can_if_t *cif, ldx_can_event_t* evt)
 {
 	can_priv_t *pdata = cif->_data;
-	int nbytes = recvmsg(pdata->tx_skt, &iodata->msg, 0);
+	pdata->iov.iov_base = &evt->frame;
+	pdata->iov.iov_len = sizeof(evt->frame);
+}
+void ldx_can_io_clear_evt_ptr(const can_if_t *cif)
+{
+	can_priv_t *pdata = cif->_data;
+	pdata->iov.iov_base = 0;
+	pdata->iov.iov_len = 0;
+}
+
+int ldx_can_read_tx_socket_i(const can_if_t *cif, ldx_can_event_t* evt)
+{
+	can_priv_t *pdata = cif->_data;
+	ldx_can_io_set_evt_ptr(cif, evt);
+	int nbytes = recvmsg(pdata->tx_skt, &pdata->msg, 0);
+	ldx_can_io_clear_evt_ptr(cif);
 	if (nbytes < 0) {
 		if (errno == ENETDOWN) {
 			log_error("%s: CAN network is down", __func__);
@@ -287,24 +294,24 @@ void ldx_can_dispatch_evt(const can_if_t *cif, ldx_can_event_t* evt)
 static int ldx_can_process_tx_socket(const can_if_t *cif)
 {
 	ldx_can_event_t evt;
-	ldx_can_iodata_t iodata;
-	ldx_can_init_iodata(cif, &evt, &iodata);
 
 	int ret = 1;
 	while (ret > 0) {
 		memset(&evt, 0, sizeof(evt));
-		ret = ldx_can_poll_tx_socket_impl(cif, &evt, &iodata);
+		ret = ldx_can_read_tx_socket_i(cif, &evt);
 		ldx_can_dispatch_evt(cif, &evt);
 	}
-
 	return ret;
 }
 
 
-static int ldx_can_poll_rx_socket_impl(can_if_t *cif, can_cb_t *rx_cb, ldx_can_event_t* evt, ldx_can_iodata_t* iodata)
+int ldx_can_read_rx_socket_i(const can_if_t *cif, int rx_skt, ldx_can_event_t* evt)
 {
 	int ret = 0;
-	int nbytes = recvmsg(rx_cb->rx_skt, &iodata->msg, 0);
+	can_priv_t* pdata = cif->_data;
+	ldx_can_io_set_evt_ptr(cif, evt);
+	int nbytes = recvmsg(rx_skt, &pdata->msg, 0);
+	ldx_can_io_clear_evt_ptr(cif);
 	if (nbytes < 0) {
 		if (errno == ENETDOWN) {
 			log_error("%s: CAN network is down", __func__);
@@ -318,36 +325,67 @@ static int ldx_can_poll_rx_socket_impl(can_if_t *cif, can_cb_t *rx_cb, ldx_can_e
 	}
 
 	if(cif->cfg.process_header) {
-		process_can_process_msgheader(&iodata->msg, &evt->tstamp, &evt->dropped_frames);
+		process_can_process_msgheader(&pdata->msg, &evt->tstamp, &evt->dropped_frames);
 		if (evt->dropped_frames) {
 			log_error("%s: CAN frames dropped", __func__);
-			cif->dropped_frames = evt->dropped_frames;
+			((can_if_t*)cif)->dropped_frames = evt->dropped_frames;
 		}
 	}
 
 	evt->is_rx = true;
-	evt->rx_skt = rx_cb->rx_skt;
+	evt->rx_skt = rx_skt;
 	evt->is_error = (0 != (evt->frame.can_id & CAN_ERR_FLAG));
 	
-	return ret;
+	return nbytes;
 }
 
 
-static int ldx_can_process_rx_socket(can_if_t *cif, can_cb_t *rx_cb)
+static int ldx_can_process_rx_socket(const can_if_t *cif, can_cb_t *rx_cb)
 {
 	ldx_can_event_t evt;
-	ldx_can_iodata_t iodata;
-	ldx_can_init_iodata(cif, &evt, &iodata);
 	
 	int ret = 1;
 	while (ret > 0) {
 		memset(&evt, 0, sizeof(evt));
-		ret = ldx_can_poll_rx_socket_impl(cif, rx_cb, &evt, &iodata);
+		ret = ldx_can_read_rx_socket_i(cif, rx_cb->rx_skt, &evt);
 		ldx_can_dispatch_evt(cif, &evt);
 	}
 	return ret;
 }
 
+
+int ldx_can_poll_one_read_i(const can_if_t* cif, fd_set* fds, ldx_can_event_t* evt)
+{
+	int ret;
+	can_cb_t* rx_cb;
+	can_priv_t* pdata = cif->_data;
+
+	/*
+	* Check the socket for each registered rx handler and
+	* trigger the callback accordingly
+	*/
+	list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
+		if (FD_ISSET(rx_cb->rx_skt, fds)) {
+			ret = ldx_can_read_rx_socket_i(cif, rx_cb->rx_skt, evt);
+			if (ret < 0) {
+				log_error("%s|%s: select error (%d|%d)",
+					cif->name, __func__, ret, errno);
+			}
+			return ret;
+		}
+	}
+
+	/* Check also the tx socket to detect errors */
+	if (FD_ISSET(pdata->tx_skt, fds)) {
+		ret = ldx_can_read_tx_socket_i(cif, evt);
+		if (ret < 0) {
+			log_error("%s|%s: select error (%d|%d)",
+				cif->name, __func__, ret, errno);
+		}
+		return ret;
+	}
+	return 0;
+}
 
 int ldx_can_poll_one(const can_if_t* cif, struct timeval* timeout, ldx_can_event_t* evt)
 {
@@ -355,10 +393,8 @@ int ldx_can_poll_one(const can_if_t* cif, struct timeval* timeout, ldx_can_event
 	int ret;
 	fd_set fds;
 
-	ldx_can_iodata_t iodata;
-	ldx_can_init_iodata(cif, evt, &iodata);
-
 	ldx_can_lock_mutex(cif, __func__);
+	ldx_can_io_set_evt_ptr(cif, evt);
 
 	memcpy(&fds, &pdata->can_fds, sizeof(fds));
 
@@ -369,40 +405,12 @@ int ldx_can_poll_one(const can_if_t* cif, struct timeval* timeout, ldx_can_event
 		ldx_can_unlock_mutex(cif);
 		return errno;
 	} else if (ret > 0) {
-		can_cb_t *rx_cb;
-
-		/*
-		* Check the socket for each registered rx handler and
-		* trigger the callback accordingly
-		*/
-		list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
-			if (FD_ISSET(rx_cb->rx_skt, &fds)) {
-				ret = ldx_can_poll_rx_socket_impl((can_if_t*)cif, rx_cb, evt, &iodata);
-				if (ret < 0) {
-					log_error("%s|%s: select error (%d|%d)",
-								cif->name, __func__, ret, errno);
-				}
-				ldx_can_unlock_mutex(cif);
-				return ret;
-			}
+		int r = ldx_can_poll_one_read_i(cif, &fds, evt);
+		if (r < 1) {
+			ret = r;
 		}
-
-		/* Check also the tx socket to detect errors */
-		if (FD_ISSET(pdata->tx_skt, &fds)) {
-			ret = ldx_can_poll_tx_socket_impl(cif, evt, &iodata);
-			if (ret < 0)
-				log_error("%s|%s: select error (%d|%d)",
-							cif->name, __func__, ret, errno);
-			ldx_can_unlock_mutex(cif);
-			return ret;
-		}
-
-		// Should there be an indication that data was processed?
-		// It may be nicer to have a poll_one function and avoid the
-		// callbacks as really they can be factored out in the polled 
-		// case (and actually are quite inconvenient).
-		ret = 0;
 	}
+	ldx_can_io_clear_evt_ptr(cif);
 
 	ldx_can_unlock_mutex(cif);
 	return ret;
@@ -718,6 +726,15 @@ err_skt_close:
 	return ret;
 }
 
+int ldx_can_get_tx_skt(const can_if_t* cif)
+{
+	if (cif) {
+		can_priv_t* priv = cif->_data;
+		return priv->tx_skt;
+	}
+	return -CAN_ERROR_NULL_INTERFACE;
+}
+
 can_if_t *ldx_can_request_by_name(const char * const if_name)
 {
 	can_if_t *cif;
@@ -738,7 +755,6 @@ can_if_t *ldx_can_request_by_name(const char * const if_name)
 		free(cif);
 		return NULL;
 	}
-
 	strncpy(cif->name, if_name, IFNAMSIZ - 1);
 	cif->name[IFNAMSIZ - 1] = '\0';
 	INIT_LIST_HEAD(&priv->err_cb_list_head);
@@ -746,6 +762,8 @@ can_if_t *ldx_can_request_by_name(const char * const if_name)
 	priv->can_tout.tv_sec = LDX_CAN_DEF_TOUT_SEC;
 	priv->can_tout.tv_usec = LDX_CAN_DEF_TOUT_USEC;
 	priv->run_thr = true;
+	ldx_can_init_iodata(priv);
+
 	cif->_data = priv;
 
 	return cif;
@@ -940,61 +958,116 @@ static can_cb_t *find_rxcb_by_function(const can_if_t *cif, const ldx_can_rx_cb_
 
 	return NULL;
 }
-
-int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
-				struct can_filter *filters, int nfilters)
+static can_cb_t* find_rxcb_by_fd(const can_if_t* cif, int fd)
 {
-	can_cb_t *rxcb;
-	can_priv_t *pdata = NULL;
-	int ret;
-
-	if (!cif)
-		return -CAN_ERROR_NULL_INTERFACE;
+	can_priv_t* pdata = cif->_data;
+	can_cb_t* rx_cb;
 
 	pdata = cif->_data;
-
-	ret = ldx_can_lock_mutex(cif, __func__);	
-	if (ret) {
-		return ret;
+	list_for_each_entry(rx_cb, &pdata->rx_cb_list_head, list) {
+		if (rx_cb->rx_skt == fd) {
+			return rx_cb;
+		}
 	}
+
+	return NULL;
+}
+
+static int ldx_can_register_rx_handler_impl(can_if_t* cif, const ldx_can_rx_cb_t cb,
+	struct can_filter* filters, int nfilters)
+{
+	int ret;
+	can_cb_t* rxcb;
+	can_priv_t* pdata = cif->_data;
 
 	/* Ensure the callback is not registered more than once */
 	rxcb = find_rxcb_by_function(cif, cb);
 	if (rxcb) {
 		log_error("%s: callback already registered on %s", __func__, cif->name);
-		ret = -CAN_ERROR_RX_CB_ALR_REG;
-		goto rx_err_unlock;
+		return -CAN_ERROR_RX_CB_ALR_REG;
 	}
 
-	rxcb = (can_cb_t *)malloc(sizeof(can_cb_t));
+	rxcb = (can_cb_t*)malloc(sizeof(can_cb_t));
 	if (!rxcb) {
 		log_error("%s: Unable to alloc memory for rx callback on %s",
-			  __func__, cif->name);
-		ret = -CAN_ERROR_NO_MEM;
-		goto rx_err_unlock;
+			__func__, cif->name);
+		return -CAN_ERROR_NO_MEM;
 	}
 
-	/*
-	 * Create the socket, set the filter condition and add it to the
-	 * the fd_set variable
-	 */
-	rxcb->rx_skt = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-	if (rxcb->rx_skt < 0) {
-		log_error("%s: Unable to create rx socket on %s", __func__,
-			  cif->name);
-		ret = -CAN_ERROR_RX_SKT_CREATE;
-		goto rx_err_free;
+	ret = ldx_can_open_rx_socket_impl(cif, filters, nfilters);
+	if (ret < 0) {
+		free(rxcb);
+		return ret;
 	}
+
+	rxcb->rx_skt = ret;
+	ret = 0;
+
+	rxcb->handler = cb;
+	list_add(&(rxcb->list), &(pdata->rx_cb_list_head));
+
+	return CAN_ERROR_NONE;
+}
+
+int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
+				struct can_filter *filters, int nfilters)
+{
+	int ret;
+	if (!cif)
+		return -CAN_ERROR_NULL_INTERFACE;
+
+	ret = ldx_can_lock_mutex(cif, __func__);	
+	if (ret) {
+		return ret;
+	}
+	ret = ldx_can_register_rx_handler_impl(cif, cb, filters, nfilters);
+	ldx_can_unlock_mutex(cif);
+	return ret;
+}
+
+int ldx_can_unregister_rx_handler(const can_if_t *cif, const ldx_can_rx_cb_t cb)
+{
+	can_cb_t *rxcb;
+	int ret;
+	if (!cif) {
+		return -CAN_ERROR_NULL_INTERFACE;
+	}
+	ret = ldx_can_lock_mutex(cif, __func__);	
+	if (ret == 0) {
+		/* Check the callback exists */
+		rxcb = find_rxcb_by_function(cif, cb);
+		if (!rxcb) {
+			log_error("%s: callback not found on %s", __func__, cif->name);
+			ret = -CAN_ERROR_RX_CB_NOT_FOUND;
+		}
+		else {
+			// Close the associated socket.  This will 
+			// remove the callback associated with the 
+			// socket file descriptor.
+			ldx_can_close_rx_socket_impl(cif, rxcb->rx_skt);
+		}
+		ldx_can_unlock_mutex(cif);
+	}
+	return ret;
+}
+
+int ldx_can_init_rx_socket(can_if_t* cif,
+	int rx_skt,
+	struct can_filter* filters, int nfilters
+) {
+	int ret = 0;
+	can_priv_t *pdata = cif->_data;
 
 	/*
 	 * Set the socket as non blocking. Anyway, it does not seem to have any
 	 * real effect setting it as blocking or non blocking.
 	 */
-	ret = fcntl(rxcb->rx_skt, F_SETFL, O_NONBLOCK);
-	if (ret)
-		goto rx_err_skt_close;
+	ret = fcntl(rx_skt, F_SETFL, O_NONBLOCK);
+	if (ret) {
+		return ret;
+	}
 
-	if(cif->cfg.process_header) {
+	if (cif->cfg.process_header) {
 		/*
 		 * For details, check:
 		 * Documentation/networking/timestamping.txt
@@ -1004,34 +1077,33 @@ int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
 		if (cif->cfg.hw_timestamp) {
 			option_name = SO_TIMESTAMPING;
 			tstamp_flags = SOF_TIMESTAMPING_SOFTWARE |
-				       SOF_TIMESTAMPING_RX_SOFTWARE |
-				       SOF_TIMESTAMPING_RAW_HARDWARE;
-		} else {
+				SOF_TIMESTAMPING_RX_SOFTWARE |
+				SOF_TIMESTAMPING_RAW_HARDWARE;
+		}
+		else {
 			option_name = SO_TIMESTAMP;
 			tstamp_flags = 1;
 		}
 
-		ret = setsockopt(rxcb->rx_skt, SOL_SOCKET, option_name,
-				  &tstamp_flags, sizeof(tstamp_flags));
+		ret = setsockopt(rx_skt, SOL_SOCKET, option_name,
+			&tstamp_flags, sizeof(tstamp_flags));
 		if (ret) {
 			log_info("%s: setsockopt %s not supported",
-				 __func__, cif->cfg.hw_timestamp ?
+				__func__, cif->cfg.hw_timestamp ?
 				"SO_TIMESTAMPING" : "SO_TIMESTAMP");
-			ret = -CAN_ERROR_SETSKTOPT_TIMESTAMP;
-			goto rx_err_skt_close;
+			return -CAN_ERROR_SETSKTOPT_TIMESTAMP;
 		}
 	}
 
 	if (cif->cfg.canfd_enabled) {
 		int canfd_en = 1;
 
-		ret = setsockopt(rxcb->rx_skt, SOL_CAN_RAW, CAN_RAW_FD_FRAMES,
-				 &canfd_en, sizeof(canfd_en));
+		ret = setsockopt(rx_skt, SOL_CAN_RAW, CAN_RAW_FD_FRAMES,
+			&canfd_en, sizeof(canfd_en));
 		if (ret < 0) {
 			log_error("%s|%s: setsockopt CAN_RAW_FD_FRAMES error",
-				  cif->name, __func__);
-			ret = -CAN_ERROR_SETSKTOPT_CANFD;
-			goto rx_err_skt_close;
+				cif->name, __func__);
+			return -CAN_ERROR_SETSKTOPT_CANFD;
 		}
 	}
 
@@ -1042,118 +1114,127 @@ int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
 		 * Try first with SO_RCVBUFFORCE which allows to exceed rmem_max limit
 		 * for privileged (CAP_NET_ADMIN) processes.
 		 */
-		ret = setsockopt(rxcb->rx_skt, SOL_SOCKET, SO_RCVBUFFORCE,
-				 &cif->cfg.rx_buf_len, sizeof(cif->cfg.rx_buf_len));
+		ret = setsockopt(rx_skt, SOL_SOCKET, SO_RCVBUFFORCE,
+			&cif->cfg.rx_buf_len, sizeof(cif->cfg.rx_buf_len));
 		if (ret < 0) {
 			log_warning("%s|%s: setsockopt SO_RCVBUFFORCE error",
-				   cif->name, __func__);
-			ret = setsockopt(rxcb->rx_skt, SOL_SOCKET, SO_RCVBUF,
-					 &cif->cfg.rx_buf_len, sizeof(cif->cfg.rx_buf_len));
+				cif->name, __func__);
+			ret = setsockopt(rx_skt, SOL_SOCKET, SO_RCVBUF,
+				&cif->cfg.rx_buf_len, sizeof(cif->cfg.rx_buf_len));
 			if (ret < 0) {
 				log_error("%s|%s: setsockopt SO_RCVBUF error",
-					  cif->name, __func__);
-				ret = -CAN_ERROR_SETSKTOPT_RCVBUF;
-				goto rx_err_skt_close;
+					cif->name, __func__);
+				return -CAN_ERROR_SETSKTOPT_RCVBUF;
 			}
 		}
 
-		ret = getsockopt(rxcb->rx_skt, SOL_SOCKET, SO_RCVBUF,
-				 &cif->cfg.rx_buf_len_rd, &size_rx_buf_len_rd);
+		ret = getsockopt(rx_skt, SOL_SOCKET, SO_RCVBUF,
+			&cif->cfg.rx_buf_len_rd, &size_rx_buf_len_rd);
 		if (ret < 0) {
 			log_error("%s|%s: getsockopt SO_RCVBUF error",
-					  cif->name, __func__);
-			ret = -CAN_ERROR_GETSKTOPT_RCVBUF;
-			goto rx_err_skt_close;
+				cif->name, __func__);
+			return -CAN_ERROR_GETSKTOPT_RCVBUF;
 		}
 	}
 
 	if (cif->cfg.error_mask) {
-		ret = setsockopt(rxcb->rx_skt, SOL_CAN_RAW, CAN_RAW_ERR_FILTER,
-				 &cif->cfg.error_mask,
-				 sizeof(cif->cfg.error_mask));
+		ret = setsockopt(rx_skt, SOL_CAN_RAW, CAN_RAW_ERR_FILTER,
+			&cif->cfg.error_mask,
+			sizeof(cif->cfg.error_mask));
 		if (ret < 0) {
 			log_error("%s: setsockopt CAN_RAW_ERR_FILTER error on %s",
-				  __func__, cif->name);
-			ret = -CAN_ERROR_SETSKTOPT_ERR_FLT;
-			goto rx_err_skt_close;
+				__func__, cif->name);
+			return -CAN_ERROR_SETSKTOPT_ERR_FLT;
 		}
 	}
 
 	if (nfilters > 0 && filters) {
-		ret = setsockopt(rxcb->rx_skt, SOL_CAN_RAW, CAN_RAW_FILTER,
-				 filters, nfilters * sizeof(struct can_filter));
+		ret = setsockopt(rx_skt, SOL_CAN_RAW, CAN_RAW_FILTER,
+			filters, nfilters * sizeof(struct can_filter));
 		if (ret) {
 			log_error("%s: setsockopt CAN_RAW_FILTER error (%d) on %s",
-				  __func__, ret, cif->name);
-			ret = -CAN_ERROR_SETSKTOPT_RAW_FLT;
-			goto rx_err_skt_close;
+				__func__, ret, cif->name);
+			return -CAN_ERROR_SETSKTOPT_RAW_FLT;
 		}
 	}
 
-	ret = bind(rxcb->rx_skt, (struct sockaddr *)&pdata->addr, sizeof(pdata->addr));
+	ret = bind(rx_skt, (struct sockaddr*)&pdata->addr, sizeof(pdata->addr));
 	if (ret < 0) {
 		log_error("%s: socket bind error on %s", __func__, cif->name);
-		ret = -CAN_ERROR_RX_SKT_BIND;
-		goto rx_err_skt_close;
+		return -CAN_ERROR_RX_SKT_BIND;
 	}
 
-	FD_SET(rxcb->rx_skt, &pdata->can_fds);
-	if (rxcb->rx_skt > pdata->maxfd)
-		pdata->maxfd = rxcb->rx_skt;
-
-	rxcb->handler = cb;
-	list_add(&(rxcb->list), &(pdata->rx_cb_list_head));
-	ldx_can_unlock_mutex(cif);
-
-	return CAN_ERROR_NONE;
-
-rx_err_skt_close:
-	close(rxcb->rx_skt);
-
-rx_err_free:
-	free(rxcb);
-
-rx_err_unlock:
-	ldx_can_unlock_mutex(cif);
+	FD_SET(rx_skt, &pdata->can_fds);
+	if (rx_skt > pdata->maxfd) {
+		pdata->maxfd = rx_skt;
+	}
 
 	return ret;
 }
 
-int ldx_can_unregister_rx_handler(const can_if_t *cif, const ldx_can_rx_cb_t cb)
+static int ldx_can_open_rx_socket_impl(can_if_t* cif,
+	struct can_filter* filters, int nfilters)
 {
-	can_priv_t *pdata = NULL;
-	can_cb_t *rxcb;
-	int ret;
+	int ret = 0;
+	int rx_skt = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	if (rx_skt < 0) {
+		log_error("%s: Unable to create rx socket on %s", __func__,
+			cif->name);
+		ret = -CAN_ERROR_RX_SKT_CREATE;
+	}
+	else {
+		ret = ldx_can_init_rx_socket(cif, rx_skt, filters, nfilters);
+		if (ret == 0) {
+			ret = rx_skt;
+		}
+		else {
+			close(rx_skt);
+		}
+	}
+	return ret;
+}
 
+int ldx_can_open_rx_socket(can_if_t* cif,
+	struct can_filter* filters, int nfilters
+) {
+	int ret;
 	if (!cif)
 		return -CAN_ERROR_NULL_INTERFACE;
 
-	pdata = cif->_data;
-	ret = ldx_can_lock_mutex(cif, __func__);	
-	if (ret) {
-		goto unreg_rxh_ret;
+	ret = ldx_can_lock_mutex(cif, __func__);
+	if (ret == 0) {
+		ret = ldx_can_open_rx_socket_impl(cif, filters, nfilters);
 	}
-
-	/* Find the callback and remove it from the list */
-	rxcb = find_rxcb_by_function(cif, cb);
-	if (!rxcb) {
-		log_error("%s: callback not found on %s", __func__, cif->name);
-		ret = -CAN_ERROR_RX_CB_NOT_FOUND;
-		goto unreg_rxh_unlock;
-	}
-
-	/* Remove the socket from can_fds and release the resources */
-	FD_CLR(rxcb->rx_skt, &pdata->can_fds);
-	close(rxcb->rx_skt);
-	list_del(&rxcb->list);
-	free(rxcb);
-
-unreg_rxh_unlock:
 	ldx_can_unlock_mutex(cif);
-
-unreg_rxh_ret:
 	return ret;
 }
+
+static void ldx_can_close_rx_socket_impl(const can_if_t* cif, int rx_skt)
+{
+	can_priv_t* pdata = cif->_data;
+	can_cb_t* rxcb = find_rxcb_by_fd(cif, rx_skt);
+	/* Remove the socket from can_fds and release the resources */
+	FD_CLR(rx_skt, &pdata->can_fds);
+	close(rx_skt);
+	if (rxcb) {
+		list_del(&rxcb->list);
+		free(rxcb);
+	}
+}
+int ldx_can_close_rx_socket(const can_if_t* cif, int rx_skt)
+{
+	int ret;
+	if (!cif)
+		return -CAN_ERROR_NULL_INTERFACE;
+
+	ret = ldx_can_lock_mutex(cif, __func__);
+	if (ret == 0) {
+		ldx_can_close_rx_socket_impl(cif, rx_skt);
+	}
+	ldx_can_unlock_mutex(cif);
+	return ret;
+}
+
 int ldx_can_set_thread_poll_rate(const can_if_t* cif, struct timeval* timeout)
 {
 	can_priv_t *pdata = cif->_data;

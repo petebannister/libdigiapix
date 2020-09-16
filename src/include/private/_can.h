@@ -96,6 +96,9 @@ typedef struct {
 
 	bool has_mutex;
 
+	struct msghdr msg;
+	struct iovec iov;
+	char ctrlmsg[CMSG_SPACE(sizeof(struct timeval) + 3 * sizeof(struct timespec) + sizeof(__u32))];
 } can_priv_t;
 
 #ifdef __cplusplus

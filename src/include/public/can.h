@@ -396,6 +396,7 @@ int ldx_can_tx_frame(const can_if_t *cif, struct canfd_frame *frame);
 int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
 				struct can_filter *filters, int nfilters);
 
+
 /**
  * ldx_can_unregister_rx_handler() - Remove the interrupt frame reception on the given CAN
  *
@@ -409,6 +410,12 @@ int ldx_can_register_rx_handler(can_if_t *cif, const ldx_can_rx_cb_t cb,
  */
 int ldx_can_unregister_rx_handler(const can_if_t *cif, const ldx_can_rx_cb_t cb);
 
+int ldx_can_open_rx_socket(can_if_t* cif,
+	struct can_filter* filters, int nfilters);
+
+int ldx_can_close_rx_socket(const can_if_t* cif, int skt);
+
+int ldx_can_get_tx_skt(const can_if_t* cif);
 /**
  * ldx_can_register_error_handler() - Start an error handler on the given CAN
  *
@@ -452,7 +459,7 @@ int ldx_can_set_thread_poll_rate_msec(const can_if_t* cif, int milliseconds);
  * normally this function should not be called directly; libdigiapix will run 
  * a background thread to do that.
  *
- * Return: EXIT_SUCCESS on success, error code otherwise.
+ * Return: EXIT_SUCCESS on success, negative error code otherwise.
  */
 int ldx_can_poll(const can_if_t* cif, struct timeval* tm);
 
@@ -479,7 +486,7 @@ int ldx_can_poll_msec(const can_if_t* cif, int milliseconds);
  * normally this function should not be called directly; libdigiapix will run 
  * a background thread to do that.
  *
- * \return: EXIT_SUCCESS on success, error code otherwise.
+ * \return: Positive value if a socket was read from.  zero if nothing happened, (negative) error code otherwise.
  */
 int ldx_can_poll_one(const can_if_t* cif, struct timeval* timeout, ldx_can_event_t* evt);
 /**
@@ -493,6 +500,24 @@ int ldx_can_poll_one(const can_if_t* cif, struct timeval* timeout, ldx_can_event
  *
  */
 void ldx_can_dispatch_evt(const can_if_t *cif, ldx_can_event_t* evt);
+
+int ldx_can_lock_mutex(const can_if_t* cif, char const* fn);
+void ldx_can_unlock_mutex(const can_if_t* cif);
+
+/**
+* Allows external select()
+* Does not lock mutex
+*/
+int ldx_can_read_tx_socket_i(const can_if_t* cif, ldx_can_event_t* evt);
+/**
+* Allows external select()
+* Does not lock mutex
+*/
+int ldx_can_read_rx_socket_i(const can_if_t* cif, int rx_skt, ldx_can_event_t* evt);
+/**
+* Does not lock mutex
+*/
+int ldx_can_read_and_dispatch_i(const can_if_t* cif, fd_set* fds);
 
 /**
  * ldx_can_strerror() - return the string describing the error
