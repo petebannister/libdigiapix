@@ -2,12 +2,8 @@ This fork was taken in order to implement a polled mode on the CAN interface.
 The existing library has exceptionally high CPU usage (on the ConnectCore6UL 
 at least).
 
-Multi-threading this is unnecessary for many applications and also a risk 
-especially if the documentation does not cover how to use the library safely.
-
-The CAN data callbacks do not include a client pointer or even the can interface 
-pointer, making the API inconvenient to use in some cases, particularly from C++
-code.
+In the default mode, the library spins up a thread for CAN data reception.  
+This is no necessary for some applications and also a risk that can be avoided.
 
 The modifications should allow the existing library to function as it did before
 whilst opening up the possibility of lower level control that does not prescribe
@@ -15,14 +11,13 @@ a threading model etc.
 
 In order to disable threading on the CAN port, specify 
 
-    polled_mode = false;
+    polled_mode = true;
 
 in the can_if_cfg struct.
 
-
 It is possible to open channels on the CAN device via ldx_can_open_rx_socket 
 and implement a select() outside of the library in order to multiplex other IO 
-within the same wait.
+(e.g. network socket IO) within the same wait.
 
 e.g.
 
@@ -56,6 +51,8 @@ e.g.
     // ...
     ldx_can_close_rx_socket(can);
     close(udp);
+
+Original README for this library:
 
 Digi APIX Library
 =================
